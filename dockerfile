@@ -19,3 +19,5 @@ EXPOSE 80
 
 # 컨테이너 시작 시, 실행할 실행 파일 or 쉘 스크립트
 CMD python Fashion.py
+
+# 기타
