@@ -1,0 +1,72 @@
+name: .NET
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+env:
+  AZURE_WEBAPP_NAME: ghhack    # set this to your application's name
+  AZURE_WEBAPP_PACKAGE_PATH: '.'      # set this to the path to your web app project, defaults to the repository root
+  DOTNET_VERSION: 3.1.x 
+  ARTIFACT_NAME: dotnetapp
+  AZURE_RGNAME: youngbin-test
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v2
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v1
+      with:
+        dotnet-version: ${{ env.DOTNET_VERSION }} 
+    - name: Restore dependencies
+      run: dotnet restore
+    - name: Build
+      run: dotnet build --no-restore
+    - name: Test
+      run: dotnet test AnimalAdoption.Web.Portal.UnitTests --no-build --verbosity normal
+    - name: Publish
+      run: dotnet publish --no-restore --output build
+    - name: Upload a Build Artifact
+      uses: actions/upload-artifact@v2.2.2
+      with:
+        name: ${{ env.ARTIFACT_NAME }}
+        path: build
+  deploy:
+    runs-on: ubuntu-latest
+    name: Deploy
+    needs: build
+    steps:
+      - name: Get Artifact
+        uses: actions/download-artifact@v2
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.ARTIFACT_NAME }}
+      - uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      # - uses: azure/arm-deploy@v1
+      #   with:
+      #     resourceGroupName: ${{ env.AZURE_RGNAME }}
+      #     template: ./azuredeploy.json
+      - uses: Azure/get-keyvault-secrets@v1
+        with:
+          keyvault: "youngbin-test-keyvault"
+          secrets: 'aaploginpass'  # comma separated list of secret keys that need to be fetched from the Key Vault 
+        id: azKeyvaultSecret
+      - uses: azure/appservice-settings@v1
+        with:
+          app-name: ${{ env.AZURE_WEBAPP_NAME }}
+          # app-settings-json: '${{ secrets.APP_SETTINGS }}' 
+          app-settings-json: '[{ "name": "GlobalPassword", "value": "${{ steps.azKeyvaultSecret.outputs.aaploginpass }}", "slotSetting": false }]'
+        id: settings
+      - name: 'Run Azure webapp deploy action using publish profile credentials'
+        uses: azure/webapps-deploy@v2
+        with: 
+          app-name: ${{ env.AZURE_WEBAPP_NAME }} # Replace with your app name
+          publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE  }} # Define secret variable in repository settings as per action documentation
+          package: ${{ env.ARTIFACT_NAME }}

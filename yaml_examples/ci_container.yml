@@ -1,0 +1,121 @@
+name: .NET Container
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+env:
+  AZURE_WEBAPP_NAME: hybcontainer     # set this to your application's name
+  AZURE_WEBAPP_PACKAGE_PATH: '.'      # set this to the path to your web app project, defaults to the repository root
+  DOTNET_VERSION: 3.1.x 
+  ARTIFACT_NAME: dotnetapp
+  AZURE_RGNAME: youngbin-test
+  OPENQA_TEST_URL: https://hybcontainer.azurewebsites.net/
+  AZALERT_ID: 934f35c4-a5bc-461e-9ccd-875d168eb168
+  ACR_NAME: hybiac
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v2
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v1
+      with:
+        dotnet-version: ${{ env.DOTNET_VERSION }} 
+    - name: Restore dependencies
+      run: dotnet restore
+    - name: Build
+      run: dotnet build --no-restore
+    - name: Test
+      run: dotnet test --no-build --verbosity normal
+      env:
+        ANIMAL_ADOPTION_FUNCTIONAL_TEST_PATH: ${{ env.OPENQA_TEST_URL }}
+  release:
+    runs-on: ubuntu-latest
+    name: Release
+    needs: build
+    steps:
+      - uses: actions/checkout@v2
+      - uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - uses: Azure/get-keyvault-secrets@v1
+        id: azKeyvaultSecret
+        with:
+          keyvault: "youngbin-test-keyvault"
+          secrets: 'aaploginpass'  # comma separated list of secret keys that need to be fetched from the Key Vault 
+      - uses: azure/appservice-settings@v1
+        with:
+          app-name: ${{ env.AZURE_WEBAPP_NAME }}
+          slot-name: 'staging'
+          app-settings-json: '[{ "name": "GlobalPassword", "value": "${{ steps.azKeyvaultSecret.outputs.aaploginpass }}", "slotSetting": false }, { "name": "APPINSIGHTS_INSTRUMENTATIONKEY", "value": "${{ secrets.APPINSIGHTS_INSTRUMENTATIONKEY }}", "slotSetting": false }]'
+        id: settings
+      # - name: 'Deploy to App Service staging slot'
+      #   uses: azure/webapps-deploy@v2
+      #   with: 
+      #     app-name: ${{ env.AZURE_WEBAPP_NAME }} # Replace with your app name
+      #     package: ${{ env.ARTIFACT_NAME }}
+      #     slot-name: 'staging'
+  # monitor:
+  #   runs-on: ubuntu-latest
+  #   name: Monitor
+  #   needs: release
+  #   outputs:
+  #     isGoodToGo: ${{ steps.checkProdAlert.outputs.isGoodToGo }}
+  #   steps:
+  #     - uses: azure/login@v1
+  #       with:
+  #         creds: ${{ secrets.AZURE_CREDENTIALS_PROD }}
+  #         enable-AzPSSession: true
+  #     - name: Check App Service Alert Status
+  #       id: checkProdAlert
+  #       uses: azure/powershell@v1
+  #       with:
+  #         inlineScript: |
+  #           Install-Module Az.AlertsManagement -Scope CurrentUser -Force
+  #           Import-Module Az.AlertsManagement
+  #           $ProdAlert = Get-AzAlert -TargetResourceGroup ${{ env.AZURE_RGNAME }} -MonitorCondition "Fired" -TimeRange '1h' | ConvertTo-JSON
+  #           if($ProdAlert -Eq $null){ echo "::set-output name=isGoodToGo::true" }
+  #         azPSVersion: latest
+  #         errorActionPreference: stop
+  deploy:
+    runs-on: ubuntu-latest
+    name: Deploy
+    needs: [release]
+    # if: ${{  needs.monitor.outputs.isGoodToGo == 'true' }}
+    steps:
+      - uses: actions/checkout@v2
+      - uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      # - name: Login to Azure Container Registry
+      #   uses: azure/CLI@v1
+      #   with:
+      #     azcliversion: latest
+      #     inlineScript: |
+      #       az acr login -n ${{ env.ACR_NAME }}
+      - uses: azure/docker-login@v1
+        with:
+          login-server: ${{ env.ACR_NAME }}.azurecr.io
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - run: |
+          docker build . -t ${{ env.ACR_NAME }}.azurecr.io/${{ env.AZURE_WEBAPP_NAME }}:${{ github.sha }}
+          docker push ${{ env.ACR_NAME }}.azurecr.io/${{ env.AZURE_WEBAPP_NAME }}:${{ github.sha }}
+          docker tag ${{ env.ACR_NAME }}.azurecr.io/${{ env.AZURE_WEBAPP_NAME }}:${{ github.sha }} ${{ env.ACR_NAME }}.azurecr.io/${{ env.AZURE_WEBAPP_NAME }}:latest
+          docker push ${{ env.ACR_NAME }}.azurecr.io/${{ env.AZURE_WEBAPP_NAME }}:latest
+      - uses: azure/webapps-deploy@v2
+        with:
+          app-name: ${{ env.AZURE_WEBAPP_NAME }}
+          images: ${{ env.ACR_NAME }}.azurecr.io/${{ env.AZURE_WEBAPP_NAME }}:${{ github.sha }}
+          slot-name: 'staging'
+      - name: Deploy to production by swapping App Service Slots
+        uses: azure/CLI@v1
+        with:
+          azcliversion: latest
+          inlineScript: |
+            az webapp deployment slot swap -n ${{ env.AZURE_WEBAPP_NAME }} -g ${{ env.AZURE_RGNAME }} -s "staging" --target-slot "production"

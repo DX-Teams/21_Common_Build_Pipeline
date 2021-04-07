@@ -1,0 +1,115 @@
+name: .NET Productuion
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+env:
+  AZURE_WEBAPP_NAME: hybiacweb    # set this to your application's name
+  AZURE_WEBAPP_PACKAGE_PATH: '.'      # set this to the path to your web app project, defaults to the repository root
+  DOTNET_VERSION: 3.1.x 
+  ARTIFACT_NAME: dotnetapp
+  AZURE_RGNAME: youngbin-iac-rg-test
+  OPENQA_TEST_URL: https://hybiacweb.azurewebsites.net/
+  AZALERT_ID: 934f35c4-a5bc-461e-9ccd-875d168eb168
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v2
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v1
+      with:
+        dotnet-version: ${{ env.DOTNET_VERSION }} 
+    - name: Restore dependencies
+      run: dotnet restore
+    - name: Build
+      run: dotnet build --no-restore
+    - name: Test
+      run: dotnet test --no-build --verbosity normal
+      env:
+        ANIMAL_ADOPTION_FUNCTIONAL_TEST_PATH: ${{ env.OPENQA_TEST_URL }}
+    - name: Publish
+      run: dotnet publish --no-restore --output build
+    - name: Upload a Build Artifact
+      uses: actions/upload-artifact@v2.2.2
+      with:
+        name: ${{ env.ARTIFACT_NAME }}
+        path: build
+  release:
+    runs-on: ubuntu-latest
+    name: Release
+    needs: build
+    steps:
+      - uses: actions/checkout@v2
+      - name: Get Artifact
+        uses: actions/download-artifact@v2
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.ARTIFACT_NAME }}
+      - uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS_PROD }}
+      - uses: azure/arm-deploy@v1
+        with:
+          resourceGroupName: ${{ env.AZURE_RGNAME }}
+          template: ./azuredeploy.json
+          parameters: .azuredeploy.parameters.json
+          deploymentMode: Incremental
+      - uses: Azure/get-keyvault-secrets@v1
+        id: azKeyvaultSecret
+        with:
+          keyvault: "hybiackv"
+          secrets: 'aaploginpass'  # comma separated list of secret keys that need to be fetched from the Key Vault 
+      - uses: azure/appservice-settings@v1
+        with:
+          app-name: ${{ env.AZURE_WEBAPP_NAME }}
+          slot-name: 'staging'
+          app-settings-json: '[{ "name": "GlobalPassword", "value": "${{ steps.azKeyvaultSecret.outputs.aaploginpass }}", "slotSetting": false }, { "name": "APPINSIGHTS_INSTRUMENTATIONKEY", "value": "${{ secrets.APPINSIGHTS_INSTRUMENTATIONKEY }}", "slotSetting": false }]'
+        id: settings
+      - name: 'Deploy to App Service staging slot'
+        uses: azure/webapps-deploy@v2
+        with: 
+          app-name: ${{ env.AZURE_WEBAPP_NAME }} # Replace with your app name
+          package: ${{ env.ARTIFACT_NAME }}
+          slot-name: 'staging'
+  monitor:
+    runs-on: ubuntu-latest
+    name: Monitor
+    needs: release
+    outputs:
+      isGoodToGo: ${{ steps.checkProdAlert.outputs.isGoodToGo }}
+    steps:
+      - uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS_PROD }}
+          enable-AzPSSession: true
+      - name: Check App Service Alert Status
+        id: checkProdAlert
+        uses: azure/powershell@v1
+        with:
+          inlineScript: |
+            Install-Module Az.AlertsManagement -Scope CurrentUser -Force
+            Import-Module Az.AlertsManagement
+            $ProdAlert = Get-AzAlert -TargetResourceGroup ${{ env.AZURE_RGNAME }} -MonitorCondition "Fired" -TimeRange '1h' | ConvertTo-JSON
+            if($ProdAlert -Eq $null){ echo "::set-output name=isGoodToGo::true" }
+          azPSVersion: latest
+          errorActionPreference: stop
+  deploy:
+    runs-on: ubuntu-latest
+    name: Deploy
+    needs: [release, monitor]
+    # if: ${{  needs.monitor.outputs.isGoodToGo == 'true' }}
+    steps:
+      - uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS_PROD }}
+      - name: Deploy to production by swapping App Service Slots
+        uses: azure/CLI@v1
+        with:
+          azcliversion: latest
+          inlineScript: |
+            az webapp deployment slot swap -n ${{ env.AZURE_WEBAPP_NAME }} -g ${{ env.AZURE_RGNAME }} -s "staging" --target-slot "production"
